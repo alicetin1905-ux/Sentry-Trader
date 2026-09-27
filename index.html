@@ -434,7 +434,7 @@
     <button class="ovtoggle" onclick="runCompare()">⇄ Compare 5 vs 8</button>
     <span id="btStatus" class="bt-status"></span>
   </div>
-  <div id="btBody"><div class="pempty">Pick a timeframe tab above, choose a depth, and run. Tests all 6 pairs over history with your targets + fees. Deeper = more history but heavier.</div></div>
+  <div id="btBody"><div class="pempty">Pick a timeframe tab above, choose a depth, and run. Replays all 6 pairs together as one portfolio (strongest pair per direction, one position per pair, margin-limited) with your targets + fees. Deeper = more history but heavier.</div></div>
 </details>
 
 <details class="settings">
@@ -455,11 +455,17 @@
     <div class="field"><label>XRP notional</label><input id="cfgNotXRP" type="number" value="2000"></div>
     <div class="field"><label>DOGE notional</label><input id="cfgNotDOGE" type="number" value="1500"></div>
     <div class="field"><label>SL basis</label>
-      <select id="cfgSlBasis"><option value="fixed">Fixed USD</option><option value="atr">ATR × mult</option></select>
+      <select id="cfgSlBasis"><option value="fixed">Fixed USD</option><option value="atr" selected>ATR × mult</option></select>
     </div>
     <div class="field"><label>SL × ATR</label><input id="cfgSlAtr" type="number" step="0.1" value="2.5"></div>
-    <div class="field"><label>Risk % of balance</label><input id="cfgRiskPct" type="number" step="0.5" value="2"></div>
+    <div class="field"><label>Risk % of balance</label><input id="cfgRiskPct" type="number" step="0.25" value="1"></div>
     <div class="field"><label>Reward : risk</label><input id="cfgRR" type="number" step="0.1" value="1.5"></div>
+    <div class="field"><label>Fresh CE flip</label>
+      <select id="cfgFresh"><option value="0">Tiebreak only</option><option value="1">Required (≤3 bars)</option></select>
+    </div>
+    <div class="field"><label>Exit</label>
+      <select id="cfgExit"><option value="tpsl">TP / SL</option><option value="ce">TP / SL + CE flip</option></select>
+    </div>
     <div class="field"><label>CoinGecko key (optional)</label><input id="cfgCgKey" type="text" placeholder="demo API key" autocomplete="off" spellcheck="false"></div>
   </div>
 </details>
@@ -633,6 +639,7 @@ function cfg(){
          BNBUSDT:+v("cfgNotBNB"), XRPUSDT:+v("cfgNotXRP"), DOGEUSDT:+v("cfgNotDOGE")},
     cgKey:(v("cfgCgKey")||"").trim(),
     slBasis:v("cfgSlBasis"), slAtr:+v("cfgSlAtr"), riskPct:+v("cfgRiskPct"), rr:+v("cfgRR"),
+    requireFresh:v("cfgFresh")==="1", ceExit:v("cfgExit")==="ce",
   };
 }
 
@@ -879,8 +886,9 @@ function evaluatePair(p,k1,k4,ticker,C){
   const cond=[];
   const want = dir==="long";
   cond.push({label:C.gateLabel+" trend", met: dir!=="none"});
-  cond.push({label:"CE + ZLSMA", met: dir!=="none" && (want?(ceDir===1&&aboveZ):(ceDir===-1&&!aboveZ)),
-             note: ceDir===(want?1:-1)?`flip ${flipBars}b ago${flipBars<=FRESH_FLIP_BARS?" · fresh":""}`:"CE opposes"});
+  const freshOk = !C.requireFresh || flipBars<=FRESH_FLIP_BARS;
+  cond.push({label:"CE + ZLSMA", met: dir!=="none" && freshOk && (want?(ceDir===1&&aboveZ):(ceDir===-1&&!aboveZ)),
+             note: ceDir===(want?1:-1)?`flip ${flipBars}b ago${flipBars<=FRESH_FLIP_BARS?" · fresh":(C.requireFresh?" · stale":"")}`:"CE opposes"});
   cond.push({label:"MACD", met: dir!=="none" && (want? hist>0 : hist<0)});
   cond.push({label:"ADX", met: adxV>=C.adxThr && adxRising});
   cond.push({label:"No dup", met: true}); // placeholder, set in pass 2 (correlation)
@@ -1189,7 +1197,7 @@ function renderCard(r,C){
    MAIN LOOP
    ========================================================================= */
 /* ---- per-timeframe state (Option B: every timeframe evaluated each cycle) ---- */
-const klineCacheTF={}, resultsTF={}, chartDataTF={}, armStateTF={}, paperTF={}, paperPrevArmTF={};
+const klineCacheTF={}, resultsTF={}, chartDataTF={}, armStateTF={}, paperTF={}, paperPrevArmTF={}, armSeededTF={};
 TFS.forEach(t=>{ klineCacheTF[t.key]={}; resultsTF[t.key]=[]; chartDataTF[t.key]={}; armStateTF[t.key]={};
   paperTF[t.key]={on:false,balance:null,open:[],closed:[],tfKey:t.key}; paperPrevArmTF[t.key]={}; });
 let lastResults=[];                 // alias -> active TF results
@@ -1226,17 +1234,20 @@ function evaluateTF(tfKey,tickers){
   resolveCorrelation(results,C);
   resultsTF[tfKey]=results;
   results.forEach(r=>{ chartDataTF[tfKey][r.pair.sym]={bars:r.bars, zl:r.zlArr, ls:r.ceLS, ss:r.ceSS, dir:r.ceDirArr}; });
-  // alerts: edge-triggered into ENTER (per-TF arm memory), label includes the timeframe
+  // alerts: edge-triggered into ENTER (per-TF arm memory), label includes the timeframe.
+  // The first evaluation after load only SEEDS the memory: a signal that was already
+  // armed before the page opened is stale, and the backtest would not enter it either.
+  const seeding=!armSeededTF[tfKey]; armSeededTF[tfKey]=true;
   const prevArm=armStateTF[tfKey];
   results.forEach(r=>{
     const v=verdictFor(r,C);
     const armedNow=(v.cls==="long"||v.cls==="short");
     const was=prevArm[r.pair.sym]||false;
-    if(armedNow && !was) fireAlert(r,v,C);
+    if(armedNow && !was && !seeding) fireAlert(r,v,C);
     prevArm[r.pair.sym]=armedNow;
   });
   // paper engine on this TF's account
-  paperEngine(results,tickers,C,paperTF[tfKey],paperPrevArmTF[tfKey]);
+  paperEngine(results,tickers,C,paperTF[tfKey],paperPrevArmTF[tfKey],seeding);
 }
 
 /* render only the active timeframe (cards/overview/paper); badges show all TFs */
@@ -1503,7 +1514,7 @@ function closePaper(pos,exit,outcome,acct){
   if(acct.closed.length>200) acct.closed.length=200;
   if(paperPersist){ idbDel("open",pos.id).catch(()=>{}); idbPut("closed",pos).catch(()=>{}); paperSaveAccount(acct); }
 }
-function paperEngine(results,tickers,C,acct,prevArm){
+function paperEngine(results,tickers,C,acct,prevArm,seeding){
   // 1) close open positions that hit TP/SL
   //    a) wick check on candle high/low of bars that opened AFTER the position
   //       (catches spikes between refresh cycles; SL-first when both hit in one
@@ -1521,18 +1532,23 @@ function paperEngine(results,tickers,C,acct,prevArm){
       }
     }
     const t=tickers[pos.sym]; if(!t) return; const px=t.price;
-    if(pos.dir==="long"){ if(px>=pos.tp) closePaper(pos,pos.tp,"TP",acct); else if(px<=pos.sl) closePaper(pos,pos.sl,"SL",acct); }
-    else                { if(px<=pos.tp) closePaper(pos,pos.tp,"TP",acct); else if(px>=pos.sl) closePaper(pos,pos.sl,"SL",acct); }
+    if(pos.dir==="long"){ if(px>=pos.tp) return closePaper(pos,pos.tp,"TP",acct); if(px<=pos.sl) return closePaper(pos,pos.sl,"SL",acct); }
+    else                { if(px<=pos.tp) return closePaper(pos,pos.tp,"TP",acct); if(px>=pos.sl) return closePaper(pos,pos.sl,"SL",acct); }
+    //    c) optional CE-flip exit: a closed bar that ended after entry flipped against us
+    if(C.ceExit && r && r.bars && r.bars.t){
+      const barClose=r.bars.t[r.ci]+C.tfMins*60000;
+      if(barClose>pos.openedAt && r.ceDir===(pos.dir==="long"?-1:1)) closePaper(pos,px,"CE",acct);
+    }
   });
   // 2) open on a fresh ENTER (edge-triggered), respecting one-per-pair + free margin
   results.forEach(r=>{
     const v=verdictFor(r,C);
     const armed=(v.cls==="long"||v.cls==="short");
     const was=prevArm[r.pair.sym]||false;
-    if(acct.on && armed && !was){
+    if(acct.on && armed && !was && !seeding){
       const hasOpen=acct.open.some(p=>p.sym===r.pair.sym);
       const usedMargin=acct.open.reduce((s,p)=>s+p.margin,0);
-      const margin=C.not[r.pair.sym]/C.lev;
+      const margin=tradePlan(C,r.pair.sym,r.price,r.atrAbs,r.dir).margin;   // same plan openPaper uses
       if(!hasOpen && (acct.balance-usedMargin)>=margin) openPaper(r,C,acct);
     }
     prevArm[r.pair.sym]=armed;
@@ -1617,16 +1633,18 @@ function manualClose(id){ const pos=paper.open.find(p=>p.id===id); if(!pos) retu
   const t=lastResults.find(r=>r.pair.sym===pos.sym), px=t?t.price:pos.entry; closePaper(pos,px,"manual",paper); renderActive(); }
 function resetPaper(){
   if(!confirm("Reset the "+activeTF.replace("h","H")+" paper account? This clears its open and closed trades and resets its balance.")) return;
-  paper.open=[]; paper.closed=[]; paper.balance=cfg().balance; paperPrevArmTF[activeTF]={};
+  paper.open=[]; paper.closed=[]; paper.balance=cfg().balance;
   if(paperPersist){ idbDeleteWhere("open",o=>o.tf===activeTF).catch(()=>{}); idbDeleteWhere("closed",o=>o.tf===activeTF).catch(()=>{}); paperSaveAccount(paper); }
   renderActive();
 }
 
 /* =========================================================================
-   BACKTEST  —  per-pair replay of the 5-condition stack over history + fees.
-   Each pair is tested independently; the cross-pair de-dup (condition 5) is a
-   live portfolio filter and is NOT applied here. Fills at the TP/SL level, no
-   slippage; if a bar's range tags both TP and SL, SL is assumed first.
+   BACKTEST  —  portfolio replay of the 5-condition stack over history + fees.
+   All pairs are stepped bar-by-bar together so the live portfolio rules apply:
+   the cross-pair de-dup (condition 5) keeps only the strongest pair per
+   direction, one position per pair, and a new trade needs free margin.
+   Fills at the TP/SL level, no slippage; if a bar's range tags both TP and SL,
+   SL is assumed first. Funding payments are not charged.
    ========================================================================= */
 let btRunning=false;
 const btResults={};   // tfKey -> {stats, perPair, periodFrom, periodTo, bars}
@@ -1643,7 +1661,9 @@ function htfDirSeries(primary, htf, C){
   return dir;
 }
 function sessionOkAt(ts){ return sessionAt(ts).ok; }  // same rules the dashboard shows
-function backtestPair(sym, primary, htf, C, mode, funding){
+
+/* per-pair signal series: which bars pass conditions 1-4 (plus the 8-cond extras) */
+function pairSignals(sym, primary, htf, C, mode, funding){
   const n=primary.c.length;
   const ce=chandelier(primary.h,primary.l,primary.c,CE_LEN,CE_MULT);
   const zl=zlsma(primary.c,ZL_LEN);
@@ -1660,44 +1680,83 @@ function backtestPair(sym, primary, htf, C, mode, funding){
       while(fj+1<funding.length && funding[fj+1].t<=ts) fj++;
       fundAt[i] = funding[fj].t<=ts ? funding[fj].rate : 0; }
   }
-  let pos=null, wasArmed=false; const trades=[];
+  const dirArr=new Array(n).fill("none"), armed=new Array(n).fill(false), flipBars=new Array(n).fill(0);
   const start=Math.max(ZL_LEN*2, ADX_LEN*3);
   for(let i=start;i<n;i++){
-    if(pos){
-      const hi=primary.h[i], lo=primary.l[i]; let exit=null, outcome=null;
-      if(pos.dir==="long"){ if(lo<=pos.sl){exit=pos.sl;outcome="SL";} else if(hi>=pos.tp){exit=pos.tp;outcome="TP";} }
-      else                { if(hi>=pos.sl){exit=pos.sl;outcome="SL";} else if(lo<=pos.tp){exit=pos.tp;outcome="TP";} }
-      if(exit!=null){
-        const gross=pos.dir==="long"?(exit-pos.entry)*pos.qty:(pos.entry-exit)*pos.qty;
-        const fee=pos.notional*FEE_RATE+(exit*pos.qty)*FEE_RATE;
-        trades.push({sym,dir:pos.dir,entry:pos.entry,exit,pnl:gross-fee,outcome,openT:pos.openT,closeT:primary.t[i],bars:i-pos.openIdx});
-        pos=null;
-      }
-    }
     const dir = htfDir[i]===1?"long":htfDir[i]===-1?"short":"none";
-    let armed=false;
+    dirArr[i]=dir; flipBars[i]=barsSinceFlip(ce.dir,i);
     if(dir!=="none" && !isNaN(zl[i]) && !isNaN(md.hist[i]) && !isNaN(ax.adx[i]) && !isNaN(ax.adx[i-1])){
       const want=dir==="long";
-      const c2 = want?(ce.dir[i]===1 && primary.c[i]>zl[i]):(ce.dir[i]===-1 && primary.c[i]<zl[i]);
+      const fresh = !C.requireFresh || flipBars[i]<=FRESH_FLIP_BARS;
+      const c2 = fresh && (want?(ce.dir[i]===1 && primary.c[i]>zl[i]):(ce.dir[i]===-1 && primary.c[i]<zl[i]));
       const c3 = want? md.hist[i]>0 : md.hist[i]<0;
       const c4 = ax.adx[i]>=C.adxThr && ax.adx[i]>ax.adx[i-1];
-      armed = c2 && c3 && c4;
-      if(armed && mode===8){
+      let ok = c2 && c3 && c4;
+      if(ok && mode===8){
         const rvolOk = volAvg[i] ? (primary.v[i]/volAvg[i])>1.5 : false;
         const sessOk = sessionOkAt(primary.t[i]+C.tfMins*60000);
         const fr = fundAt ? fundAt[i] : 0;
         const fundOk = want ? fr<=FUND_EXTREME : fr>=-FUND_EXTREME;
-        armed = rvolOk && sessOk && fundOk;
+        ok = rvolOk && sessOk && fundOk;
       }
+      armed[i]=ok;
     }
-    if(!pos && armed && !wasArmed){
-      const entry=primary.c[i];
-      const P=tradePlan(C,sym,entry,atrSeries[i],dir);   // same sizing the live cards use
-      pos={dir,entry,qty:P.qty,notional:P.notional,openT:primary.t[i],openIdx:i,tp:P.tp,sl:P.sl};
+  }
+  const idxOf=new Map(); primary.t.forEach((t,i)=>idxOf.set(t,i));
+  return {sym, bars:primary, idxOf, dir:dirArr, armed, flipBars, adx:ax.adx, ceDir:ce.dir, atr:atrSeries};
+}
+
+/* step every pair through time together, applying the live portfolio rules */
+function simulatePortfolio(sigs, C){
+  const times=[...new Set(sigs.flatMap(s=>s.bars.t))].sort((a,b)=>a-b);
+  const open={}, wasArmed={}, trades=[];
+  let balance=C.balance;
+  const close=(s,pos,i,exit,outcome)=>{
+    const gross=pos.dir==="long"?(exit-pos.entry)*pos.qty:(pos.entry-exit)*pos.qty;
+    const fee=pos.notional*FEE_RATE+(exit*pos.qty)*FEE_RATE;
+    trades.push({sym:s.sym,dir:pos.dir,entry:pos.entry,exit,pnl:gross-fee,outcome,openT:pos.openT,closeT:s.bars.t[i],bars:i-pos.openIdx});
+    balance+=gross-fee; delete open[s.sym];
+  };
+  for(const ts of times){
+    const live=[];
+    for(const s of sigs){ const i=s.idxOf.get(ts); if(i!==undefined) live.push({s,i}); }
+    // 1) exits on this bar
+    for(const {s,i} of live){
+      const pos=open[s.sym]; if(!pos) continue;
+      const hi=s.bars.h[i], lo=s.bars.l[i];
+      if(pos.dir==="long"){ if(lo<=pos.sl){close(s,pos,i,pos.sl,"SL");continue;} if(hi>=pos.tp){close(s,pos,i,pos.tp,"TP");continue;} }
+      else                { if(hi>=pos.sl){close(s,pos,i,pos.sl,"SL");continue;} if(lo<=pos.tp){close(s,pos,i,pos.tp,"TP");continue;} }
+      if(C.ceExit && s.ceDir[i]===(pos.dir==="long"?-1:1)) close(s,pos,i,s.bars.c[i],"CE");
     }
-    wasArmed=armed;
+    // 2) condition 5: only the strongest armed pair per direction counts as armed
+    const full={};
+    ["long","short"].forEach(d=>{
+      const cands=live.filter(({s,i})=>s.armed[i] && s.dir[i]===d);
+      cands.sort((a,b)=>{
+        const fa=a.s.flipBars[a.i]<=FRESH_FLIP_BARS, fb=b.s.flipBars[b.i]<=FRESH_FLIP_BARS;
+        if(fa!==fb) return fa?-1:1;
+        return b.s.adx[b.i]-a.s.adx[a.i];
+      });
+      if(cands.length) full[cands[0].s.sym]=true;
+    });
+    // 3) edge-triggered entries: one per pair, only with free margin
+    for(const {s,i} of live){
+      const armedNow=!!full[s.sym];
+      if(armedNow && !wasArmed[s.sym] && !open[s.sym]){
+        const entry=s.bars.c[i], dir=s.dir[i];
+        const P=tradePlan(C,s.sym,entry,s.atr[i],dir);   // same sizing the live cards use
+        const used=Object.values(open).reduce((a,p)=>a+p.margin,0);
+        if(balance-used>=P.margin)
+          open[s.sym]={dir,entry,qty:P.qty,notional:P.notional,margin:P.margin,openT:ts,openIdx:i,tp:P.tp,sl:P.sl};
+      }
+      wasArmed[s.sym]=armedNow;
+    }
   }
   return trades;
+}
+function perPairSummary(trades,sym){
+  const tr=trades.filter(t=>t.sym===sym);
+  return {n:tr.length, net:tr.reduce((s,t)=>s+t.pnl,0), wr:tr.length?tr.filter(t=>t.pnl>0).length/tr.length*100:0};
 }
 function aggregateBacktest(allTrades, C){
   allTrades.sort((a,b)=>a.closeT-b.closeT);
@@ -1717,17 +1776,17 @@ async function runBacktest(){
   const htfDepth=Math.ceil(depth*C.tfMins/C.htfMins)+260;
   const statusEl=document.getElementById("btStatus");
   try{
-    const allTrades=[], perPair=[]; let meta=null;
+    const sigs=[]; let meta=null;
     for(let i=0;i<PAIRS.length;i++){
       const p=PAIRS[i];
-      statusEl.textContent=`Fetching & testing ${p.base}… (${i+1}/${PAIRS.length})`;
+      statusEl.textContent=`Fetching ${p.base}… (${i+1}/${PAIRS.length})`;
       const [primary,htf]=await Promise.all([ fetchKlinesChained(p.sym,C.tf,depth), fetchKlinesChained(p.sym,C.htf,htfDepth) ]);
-      const trades=backtestPair(p.sym,primary,htf,C,5,null);
-      const net=trades.reduce((s,t)=>s+t.pnl,0), w=trades.filter(t=>t.pnl>0).length;
-      perPair.push({base:p.base,n:trades.length,wr:trades.length?w/trades.length*100:0,net});
-      allTrades.push(...trades);
+      sigs.push(pairSignals(p.sym,primary,htf,C,5,null));
       if(i===0 && primary.t.length) meta={periodFrom:primary.t[0],periodTo:primary.t[primary.t.length-1],bars:primary.t.length};
     }
+    statusEl.textContent="Simulating portfolio…";
+    const allTrades=simulatePortfolio(sigs,C);
+    const perPair=PAIRS.map(p=>({base:p.base,...perPairSummary(allTrades,p.sym)}));
     const stats=aggregateBacktest(allTrades,C);
     btResults[tfKey]={stats,perPair,...meta};
     statusEl.textContent="";
@@ -1758,21 +1817,21 @@ async function runCompare(){
   const htfDepth=Math.ceil(depth*C.tfMins/C.htfMins)+260;
   const statusEl=document.getElementById("btStatus");
   try{
-    const t5=[], t8=[], perPair=[]; let meta=null;
+    const s5=[], s8=[]; let meta=null;
     for(let i=0;i<PAIRS.length;i++){
       const p=PAIRS[i];
       statusEl.textContent=`Comparing ${p.base}… (${i+1}/${PAIRS.length})`;
       const [primary,htf]=await Promise.all([ fetchKlinesChained(p.sym,C.tf,depth), fetchKlinesChained(p.sym,C.htf,htfDepth) ]);
       const since=primary.t.length?primary.t[0]:0;
       const funding=await fetchFundingHistory(p.sym, since);
-      const tr5=backtestPair(p.sym,primary,htf,C,5,null);
-      const tr8=backtestPair(p.sym,primary,htf,C,8,funding);
-      const sum=tr=>({n:tr.length, net:tr.reduce((s,t)=>s+t.pnl,0), wr:tr.length?tr.filter(t=>t.pnl>0).length/tr.length*100:0});
-      const a=sum(tr5), b=sum(tr8);
-      perPair.push({base:p.base, n5:a.n,net5:a.net,wr5:a.wr, n8:b.n,net8:b.net,wr8:b.wr});
-      t5.push(...tr5); t8.push(...tr8);
+      s5.push(pairSignals(p.sym,primary,htf,C,5,null));
+      s8.push(pairSignals(p.sym,primary,htf,C,8,funding));
       if(i===0 && primary.t.length) meta={periodFrom:primary.t[0],periodTo:primary.t[primary.t.length-1],bars:primary.t.length};
     }
+    statusEl.textContent="Simulating portfolios…";
+    const t5=simulatePortfolio(s5,C), t8=simulatePortfolio(s8,C);
+    const perPair=PAIRS.map(p=>{ const a=perPairSummary(t5,p.sym), b=perPairSummary(t8,p.sym);
+      return {base:p.base, n5:a.n,net5:a.net,wr5:a.wr, n8:b.n,net8:b.net,wr8:b.wr}; });
     btResults[tfKey]={compare:{s5:aggregateBacktest(t5,C), s8:aggregateBacktest(t8,C), perPair}, ...meta};
     statusEl.textContent="";
     renderCompare(tfKey,C);
